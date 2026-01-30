@@ -18,6 +18,17 @@ function isHelpdeskTopic(text = "") {
 }
 
 export default function handler(req, res) {
+  // ✅ CORS (allow GitHub Pages / browser requests)
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // ✅ Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  // Only allow POST
   if (req.method !== "POST") {
     res.statusCode = 405;
     return res.json({ error: "Method not allowed" });
@@ -32,13 +43,7 @@ export default function handler(req, res) {
         return res.json({ error: "Message is required" });
       }
 
-      if (!isHelpdeskTopic(message)) {
-        return res.json({
-          text:
-            "I can assist with PCC Helpdesk issues only (computer, printer, Wi-Fi, and account access). " +
-            "For other concerns, please contact the PCC Helpdesk at 808-293-3160."
-        });
-      }
+      // ... keep the rest of your existing logic unchanged
 
       const systemPrompt = `
 You are the Polynesian Cultural Center HelpDesk virtual assistant.
