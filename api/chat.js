@@ -19,7 +19,7 @@ function isHelpdeskTopic(text = "") {
 
 export default async function handler(req, res) {
   // ✅ TEMPORARY: allow all origins (to confirm API works)
-  res.setHeader("Access-Control-Allow-Origin", "https://jatzter12.github.io");
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
