@@ -4,7 +4,6 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// Simple allowlist: keeps the bot focused on PCC Helpdesk topics
 function isHelpdeskTopic(text = "") {
   const t = text.toLowerCase();
   return [
@@ -18,60 +17,33 @@ function isHelpdeskTopic(text = "") {
   ].some(k => t.includes(k));
 }
 
-export default async function handler(req, res) {
-  // Only allow POST
+export default function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    res.statusCode = 405;
+    return res.json({ error: "Method not allowed" });
   }
 
-  try {
-    const { message, history = [] } = req.body || {};
+  (async () => {
+    try {
+      const { message, history = [] } = req.body || {};
 
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Message is required" });
-    }
+      if (!message) {
+        res.statusCode = 400;
+        return res.json({ error: "Message is required" });
+      }
 
-    // Hard restriction (code-level)
-    if (!isHelpdeskTopic(message)) {
-      return res.json({
-        text:
-          "I can assist with PCC Helpdesk issues only (computer, printer, Wi-Fi/internet, and basic account access). " +
-          "For other concerns, please contact the PCC Helpdesk at 808-293-3160."
-      });
-    }
+      if (!isHelpdeskTopic(message)) {
+        return res.json({
+          text:
+            "I can assist with PCC Helpdesk issues only (computer, printer, Wi-Fi, and account access). " +
+            "For other concerns, please contact the PCC Helpdesk at 808-293-3160."
+        });
+      }
 
-    // Policy / restrictions (prompt-level)
-    const systemPrompt = `
+      const systemPrompt = `
 You are the Polynesian Cultural Center HelpDesk virtual assistant.
 
-Scope:
-- Computer, printer, Wi-Fi/internet, and basic account access issues.
-
 Rules:
-- Give clear, step-by-step instructions.
-- Keep responses concise.
-- Never request passwords or MFA codes.
-- If the issue requires hands-on support or you are unsure, escalate.
-
-Escalation:
-PCC Helpdesk
-Phone: 808-293-3160
-Email: helpdesk@pcc.edu
-`;
-
-    const response = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: [
-        { role: "system", content: systemPrompt },
-        ...history,
-        { role: "user", content: message }
-      ],
-      max_output_tokens: 300
-    });
-
-    return res.json({ text: response.output_text });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-}
+- PCC IT issues only
+- Step-by-step answers
+- Never as
