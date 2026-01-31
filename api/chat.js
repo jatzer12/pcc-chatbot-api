@@ -1,15 +1,6 @@
 import OpenAI from "openai";
 
 /**
- * ✅ CORS allowlist
- * NOTE: CORS only affects browsers. It does not stop curl/Postman.
- */
-const ALLOWED_ORIGINS = new Set([
-  "https://jatzer12.github.io",
-  "http://localhost:5500" // optional for local testing
-]);
-
-/**
  * ✅ Basic IP rate limiting (best-effort on Vercel serverless)
  * - 20 requests per minute per IP
  * You can tune RATE_MAX higher/lower.
@@ -42,14 +33,12 @@ function rateLimit(ip) {
   return { ok: true };
 }
 
+/**
+ * ✅ PUBLIC CORS (Option B)
+ * Allows any website to call your API from the browser.
+ */
 function setCors(req, res) {
-  const origin = req.headers.origin;
-
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-
-  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
@@ -104,7 +93,11 @@ function normalizeHistory(history) {
       role: h.role,
       content: typeof h.content === "string" ? h.content : ""
     }))
-    .filter((h) => (h.role === "user" || h.role === "assistant") && h.content.trim().length > 0);
+    .filter(
+      (h) =>
+        (h.role === "user" || h.role === "assistant") &&
+        h.content.trim().length > 0
+    );
 
   return cleaned.slice(-20);
 }
@@ -139,7 +132,7 @@ function validateRequestBody(body) {
 }
 
 export default async function handler(req, res) {
-  // ✅ CORS allowlist
+  // ✅ PUBLIC CORS
   setCors(req, res);
 
   // ✅ Preflight
