@@ -70,7 +70,7 @@ export default async function handler(req, res) {
     const messagesForModel = [SYSTEM_MESSAGE, ...userMessages];
 
     const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4.1-mini",
       messages: messagesForModel,
       temperature: 0.2
     });
