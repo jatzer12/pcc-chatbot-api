@@ -3,12 +3,6 @@ import { createClient } from "@supabase/supabase-js";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Server-only Supabase client (admin)
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
 // Lock CORS to your GitHub Pages site
 const ALLOWED_ORIGIN = "https://jatzer12.github.io";
 
@@ -16,7 +10,13 @@ const ALLOWED_ORIGIN = "https://jatzer12.github.io";
 const ESCALATION_PHONE = "808-293-3160";
 const ESCALATION_EMAIL = "mis@polynesia.com";
 
-// ✅ System instructions (this is your “training” / behavior rules)
+// Server-only Supabase client (admin)
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ✅ System instructions (your “training” / behavior rules)
 const SYSTEM_MESSAGE = {
   role: "system",
   content: [
@@ -47,14 +47,14 @@ const SYSTEM_MESSAGE = {
     "ACCURACY RULE (no guessing):",
     "- Do NOT invent facts (hours, prices, phone numbers, emails, addresses, policies).",
     "- If you are not sure, say you are not sure and offer the best next step (official PCC page or the correct PCC contact).",
-    "- If document/knowledge snippets are provided to you, use them as the source of truth.",
+    "- If knowledge snippets are provided below, treat them as the source of truth.",
     "",
     "ROUTING (decide the best response type):",
     "1) If it is an IT/HelpDesk issue (computer, printer, Wi-Fi, PCC email/login, Microsoft 365 apps): use troubleshooting steps.",
     "2) If it is general PCC info (address, directions, reservations, tickets, hours, departments): answer directly and clearly. Use steps only if the user needs a process (example: 'how to reserve').",
     "",
     "CONTACT RULES:",
-    "- You may share PUBLIC PCC contact info (example: Reservations contact) when the user asks for it or it is clearly needed.",
+    "- You may share PUBLIC PCC contact info when the user asks for it or it is clearly needed.",
     "- Do NOT share PCC HelpDesk escalation phone/email unless escalation is needed (see below).",
     "",
     "ESCALATION RULE (HelpDesk/IT only):",
@@ -70,6 +70,34 @@ const SYSTEM_MESSAGE = {
     "- If escalating (IT only): One short sentence + the phone and email lines."
   ].join("\n")
 };
+
+async function getKbSnippets(latestUserText, topK = 5) {
+  // 1) embed the question
+  const emb = await client.embeddings.create({
+    model: "text-embedding-3-small",
+    input: latestUserText
+  });
+
+  const queryEmbedding = emb.data?.[0]?.embedding;
+  if (!queryEmbedding) return [];
+
+  // 2) vector search against Supabase function
+  const { data, error } = await supabaseAdmin.rpc("match_kb_chunks", {
+    query_embedding: queryEmbedding,
+    match_count: topK
+  });
+
+  if (error) {
+    console.error("KB search error:", error);
+    return [];
+  }
+
+  // Optional: keep only reasonably relevant results
+  // similarity is 0..1 (higher is better). Adjust if needed.
+  const filtered = (data || []).filter(r => (r.similarity ?? 0) >= 0.72);
+
+  return filtered;
+}
 
 export default async function handler(req, res) {
   // --- CORS ---
@@ -93,48 +121,36 @@ export default async function handler(req, res) {
         ? incomingMessages.filter(m => m && m.role && m.content && m.role !== "system")
         : [{ role: "user", content: message }];
 
-    // ✅ Use the latest user message as the query for retrieval
-    const lastUserMsg =
-      [...userMessages].reverse().find(m => m.role === "user" && typeof m.content === "string" && m.content.trim())?.content?.trim()
-      || message.trim();
+    // Find latest user message for retrieval
+    const latestUser = [...userMessages].reverse().find(m => m.role === "user");
+    const latestUserText = latestUser?.content ? String(latestUser.content) : "";
 
-    // If somehow empty, block it
-    if (!lastUserMsg) return res.status(400).json({ error: "Message is required" });
+    // 1) Retrieve KB snippets
+    const kb = latestUserText ? await getKbSnippets(latestUserText, 5) : [];
 
-    // 1) Embed the user's latest question
-    const emb = await client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: lastUserMsg
-    });
+    const kbBlock = kb.length
+      ? [
+          "KNOWLEDGE BASE SNIPPETS (use as source of truth):",
+          ...kb.map((r, i) => {
+            const meta = [
+              r.title ? `title="${r.title}"` : null,
+              r.category ? `category="${r.category}"` : null,
+              r.doc_id ? `doc_id="${r.doc_id}"` : null,
+              typeof r.similarity === "number" ? `similarity=${r.similarity.toFixed(3)}` : null
+            ].filter(Boolean).join(" | ");
 
-    const queryEmbedding = emb.data[0].embedding;
+            return `(${i + 1}) ${meta}\n${r.content}`;
+          })
+        ].join("\n\n")
+      : "KNOWLEDGE BASE SNIPPETS: (none found for this question)";
 
-    // 2) Retrieve top KB chunks
-    const { data: matches, error: matchError } = await supabaseAdmin.rpc("match_kb_chunks", {
-      query_embedding: queryEmbedding,
-      match_count: 5
-    });
+    // 2) Add KB block as an additional system message
+    const kbSystemMessage = {
+      role: "system",
+      content: kbBlock + "\n\nRULE: If the answer is not in the KB snippets and you are not sure, say you are not sure and provide the best next step."
+    };
 
-    if (matchError) throw matchError;
-
-    // 3) Build KB context for the model
-    const kbContext = (matches || []).map((m, i) => {
-      const label = m.title || m.doc_id || `source-${i + 1}`;
-      return `Source ${i + 1}: ${label}\n${m.content}`;
-    }).join("\n\n");
-
-    // 4) Put KB context right before the user messages
-    const messagesForModel = [
-      SYSTEM_MESSAGE,
-      {
-        role: "system",
-        content:
-          kbContext
-            ? `KNOWLEDGE BASE (use as source of truth):\n\n${kbContext}`
-            : "KNOWLEDGE BASE: (no matching snippets found for this question). If unsure, say you are not sure and offer the correct PCC contact/next step."
-      },
-      ...userMessages
-    ];
+    const messagesForModel = [SYSTEM_MESSAGE, kbSystemMessage, ...userMessages];
 
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -143,19 +159,7 @@ export default async function handler(req, res) {
     });
 
     const reply = completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
-
-    // ✅ Optional: return sources so you can display/debug what was used
-    return res.status(200).json({
-      reply,
-      sources: (matches || []).map(m => ({
-        id: m.id,
-        doc_id: m.doc_id,
-        title: m.title,
-        category: m.category,
-        similarity: m.similarity
-      }))
-    });
-
+    return res.status(200).json({ reply });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message || "Server error" });
