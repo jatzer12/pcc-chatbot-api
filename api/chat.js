@@ -1,5 +1,4 @@
 import OpenAI from "openai";
-import { createClient } from "@supabase/supabase-js";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -10,13 +9,23 @@ const ALLOWED_ORIGIN = "https://jatzer12.github.io";
 const ESCALATION_PHONE = "808-293-3160";
 const ESCALATION_EMAIL = "mis@polynesia.com";
 
-// Server-only Supabase client (admin)
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+/** -----------------------------
+ *  GitHub KB Config
+ *  KB is stored in jatzer12/PCC-Chatbot/kb/
+ * ----------------------------- */
+const GITHUB_OWNER = "jatzer12";
+const GITHUB_REPO = "PCC-Chatbot";
+const GITHUB_BRANCH = "main";
+const RAW_BASE = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}`;
 
-// ✅ System instructions (your “training” / behavior rules)
+/** -----------------------------
+ *  KB Cache (warm invocations)
+ * ----------------------------- */
+let KB_CACHE = null;
+let KB_CACHE_AT = 0;
+const KB_TTL_MS = 5 * 60 * 1000;
+
+/** ✅ System instructions (your “training” / behavior rules) */
 const SYSTEM_MESSAGE = {
   role: "system",
   content: [
@@ -71,32 +80,77 @@ const SYSTEM_MESSAGE = {
   ].join("\n")
 };
 
-async function getKbSnippets(latestUserText, topK = 5) {
-  // 1) embed the question
-  const emb = await client.embeddings.create({
-    model: "text-embedding-3-small",
-    input: latestUserText
-  });
+/** -----------------------------
+ *  Simple text retrieval (keyword)
+ * ----------------------------- */
+function tokenize(text) {
+  return String(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
 
-  const queryEmbedding = emb.data?.[0]?.embedding;
-  if (!queryEmbedding) return [];
+function chunkText(text, chunkSize = 900, overlap = 150) {
+  const s = String(text).replace(/\r/g, "");
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    out.push(s.slice(i, i + chunkSize).trim());
+    i += (chunkSize - overlap);
+  }
+  return out.filter(Boolean);
+}
 
-  // 2) vector search against Supabase function
-  const { data, error } = await supabaseAdmin.rpc("match_kb_chunks", {
-    query_embedding: queryEmbedding,
-    match_count: topK
-  });
+function scoreChunk(queryTokens, chunk) {
+  const c = chunk.toLowerCase();
+  let score = 0;
+  for (const t of queryTokens) {
+    if (t.length < 3) continue;
+    if (c.includes(t)) score += 2;
+  }
+  return score;
+}
 
-  if (error) {
-    console.error("KB search error:", error);
-    return [];
+async function loadKB() {
+  const now = Date.now();
+  if (KB_CACHE && (now - KB_CACHE_AT) < KB_TTL_MS) return KB_CACHE;
+
+  const idxRes = await fetch(`${RAW_BASE}/kb/index.json`);
+  if (!idxRes.ok) throw new Error("Failed to load kb/index.json from GitHub RAW");
+  const idx = await idxRes.json();
+
+  const docs = [];
+  for (const f of idx.files || []) {
+    const r = await fetch(`${RAW_BASE}/${f.path}`);
+    if (!r.ok) continue;
+
+    const text = await r.text();
+    const chunks = chunkText(text);
+
+    chunks.forEach((ch, i) => {
+      docs.push({
+        id: `${f.id}#${i}`,
+        title: f.title || f.id,
+        text: ch
+      });
+    });
   }
 
-  // Optional: keep only reasonably relevant results
-  // similarity is 0..1 (higher is better). Adjust if needed.
-  const filtered = (data || []).filter(r => (r.similarity ?? 0) >= 0.72);
+  KB_CACHE = docs;
+  KB_CACHE_AT = now;
+  return docs;
+}
 
-  return filtered;
+function retrieveSnippets(query, docs, topK = 5) {
+  const qTokens = tokenize(query);
+  const scored = docs
+    .map(d => ({ ...d, score: scoreChunk(qTokens, d.text) }))
+    .filter(d => d.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+
+  return scored;
 }
 
 export default async function handler(req, res) {
@@ -125,21 +179,15 @@ export default async function handler(req, res) {
     const latestUser = [...userMessages].reverse().find(m => m.role === "user");
     const latestUserText = latestUser?.content ? String(latestUser.content) : "";
 
-    // 1) Retrieve KB snippets
-    const kb = latestUserText ? await getKbSnippets(latestUserText, 5) : [];
+    // 1) Retrieve KB snippets from GitHub KB folder
+    const kbDocs = await loadKB();
+    const hits = latestUserText ? retrieveSnippets(latestUserText, kbDocs, 5) : [];
 
-    const kbBlock = kb.length
+    const kbBlock = hits.length
       ? [
           "KNOWLEDGE BASE SNIPPETS (use as source of truth):",
-          ...kb.map((r, i) => {
-            const meta = [
-              r.title ? `title="${r.title}"` : null,
-              r.category ? `category="${r.category}"` : null,
-              r.doc_id ? `doc_id="${r.doc_id}"` : null,
-              typeof r.similarity === "number" ? `similarity=${r.similarity.toFixed(3)}` : null
-            ].filter(Boolean).join(" | ");
-
-            return `(${i + 1}) ${meta}\n${r.content}`;
+          ...hits.map((r, i) => {
+            return `(${i + 1}) title="${r.title}" | id="${r.id}" | score=${r.score}\n${r.text}`;
           })
         ].join("\n\n")
       : "KNOWLEDGE BASE SNIPPETS: (none found for this question)";
@@ -147,7 +195,9 @@ export default async function handler(req, res) {
     // 2) Add KB block as an additional system message
     const kbSystemMessage = {
       role: "system",
-      content: kbBlock + "\n\nRULE: If the answer is not in the KB snippets and you are not sure, say you are not sure and provide the best next step."
+      content:
+        kbBlock +
+        "\n\nRULE: If the answer is not in the KB snippets and you are not sure, say you are not sure and provide the best next step."
     };
 
     const messagesForModel = [SYSTEM_MESSAGE, kbSystemMessage, ...userMessages];
