@@ -1,8 +1,11 @@
 {
   "name": "pcc-chatbot-api",
   "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "openai": "^4.0.0",
-    "@supabase/supabase-js": "^2.39.3"
+    "openai": "^4.0.0"
   }
 }
