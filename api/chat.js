@@ -1,31 +1,36 @@
 import OpenAI from "openai";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+/**
+ * PCC Chatbot API (GitHub KB version)
+ * - Reads KB files from jatzer12/PCC-Chatbot/kb/
+ * - Retrieves relevant snippets (keyword-based)
+ * - Injects snippets into the model as system context
+ * - Returns { reply } to match your frontend
+ */
 
-// Lock CORS to your GitHub Pages site
+/** ---------- Config ---------- */
 const ALLOWED_ORIGIN = "https://jatzer12.github.io";
 
-// ✅ Escalation contact info (only used when needed)
 const ESCALATION_PHONE = "808-293-3160";
 const ESCALATION_EMAIL = "mis@polynesia.com";
 
-/** -----------------------------
- *  GitHub KB Config
- *  KB is stored in jatzer12/PCC-Chatbot/kb/
- * ----------------------------- */
 const GITHUB_OWNER = "jatzer12";
 const GITHUB_REPO = "PCC-Chatbot";
 const GITHUB_BRANCH = "main";
 const RAW_BASE = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}`;
 
-/** -----------------------------
- *  KB Cache (warm invocations)
- * ----------------------------- */
 let KB_CACHE = null;
 let KB_CACHE_AT = 0;
 const KB_TTL_MS = 5 * 60 * 1000;
 
-/** ✅ System instructions (your “training” / behavior rules) */
+/** ---------- OpenAI Client (lazy init so missing env is reported cleanly) ---------- */
+function getOpenAIClient() {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return null;
+  return new OpenAI({ apiKey: key });
+}
+
+/** ---------- System Instructions ---------- */
 const SYSTEM_MESSAGE = {
   role: "system",
   content: [
@@ -80,9 +85,7 @@ const SYSTEM_MESSAGE = {
   ].join("\n")
 };
 
-/** -----------------------------
- *  Simple text retrieval (keyword)
- * ----------------------------- */
+/** ---------- Retrieval Helpers ---------- */
 function tokenize(text) {
   return String(text)
     .toLowerCase()
@@ -116,14 +119,29 @@ async function loadKB() {
   const now = Date.now();
   if (KB_CACHE && (now - KB_CACHE_AT) < KB_TTL_MS) return KB_CACHE;
 
-  const idxRes = await fetch(`${RAW_BASE}/kb/index.json`);
-  if (!idxRes.ok) throw new Error("Failed to load kb/index.json from GitHub RAW");
-  const idx = await idxRes.json();
+  const idxUrl = `${RAW_BASE}/kb/index.json`;
+  const idxRes = await fetch(idxUrl);
 
+  if (!idxRes.ok) {
+    const body = await idxRes.text().catch(() => "");
+    console.error("KB index fetch failed:", idxUrl, idxRes.status, body.slice(0, 200));
+    KB_CACHE = [];
+    KB_CACHE_AT = now;
+    return KB_CACHE;
+  }
+
+  const idx = await idxRes.json();
   const docs = [];
+
   for (const f of idx.files || []) {
-    const r = await fetch(`${RAW_BASE}/${f.path}`);
-    if (!r.ok) continue;
+    const fileUrl = `${RAW_BASE}/${f.path}`;
+    const r = await fetch(fileUrl);
+
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      console.error("KB file fetch failed:", fileUrl, r.status, body.slice(0, 200));
+      continue;
+    }
 
     const text = await r.text();
     const chunks = chunkText(text);
@@ -144,17 +162,16 @@ async function loadKB() {
 
 function retrieveSnippets(query, docs, topK = 5) {
   const qTokens = tokenize(query);
-  const scored = docs
+  return docs
     .map(d => ({ ...d, score: scoreChunk(qTokens, d.text) }))
     .filter(d => d.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, topK);
-
-  return scored;
 }
 
+/** ---------- Handler ---------- */
 export default async function handler(req, res) {
-  // --- CORS ---
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -164,22 +181,29 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
+    // Clear error if env is missing (common cause of 500)
+    const openai = getOpenAIClient();
+    if (!openai) {
+      return res.status(500).json({
+        error: "Missing OPENAI_API_KEY in Vercel environment variables."
+      });
+    }
+
     const body = req.body || {};
 
-    // ✅ Prefer full history from frontend
+    // Your frontend sends { messages }
     const incomingMessages = Array.isArray(body.messages) ? body.messages : null;
-    const message = typeof body.message === "string" ? body.message : "";
+    const fallbackMessage = typeof body.message === "string" ? body.message : "";
 
     const userMessages =
       (incomingMessages && incomingMessages.length)
         ? incomingMessages.filter(m => m && m.role && m.content && m.role !== "system")
-        : [{ role: "user", content: message }];
+        : [{ role: "user", content: fallbackMessage }];
 
-    // Find latest user message for retrieval
     const latestUser = [...userMessages].reverse().find(m => m.role === "user");
     const latestUserText = latestUser?.content ? String(latestUser.content) : "";
 
-    // 1) Retrieve KB snippets from GitHub KB folder
+    // Load KB and retrieve
     const kbDocs = await loadKB();
     const hits = latestUserText ? retrieveSnippets(latestUserText, kbDocs, 5) : [];
 
@@ -192,7 +216,6 @@ export default async function handler(req, res) {
         ].join("\n\n")
       : "KNOWLEDGE BASE SNIPPETS: (none found for this question)";
 
-    // 2) Add KB block as an additional system message
     const kbSystemMessage = {
       role: "system",
       content:
@@ -202,7 +225,7 @@ export default async function handler(req, res) {
 
     const messagesForModel = [SYSTEM_MESSAGE, kbSystemMessage, ...userMessages];
 
-    const completion = await client.chat.completions.create({
+    const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: messagesForModel,
       temperature: 0.2
@@ -211,7 +234,10 @@ export default async function handler(req, res) {
     const reply = completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
     return res.status(200).json({ reply });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message || "Server error" });
+    console.error("API crash:", err);
+    return res.status(500).json({
+      error: err?.message || "Server error",
+      hint: "Check Vercel logs. Most common causes: missing OPENAI_API_KEY, or KB files not reachable via GitHub RAW."
+    });
   }
 }
