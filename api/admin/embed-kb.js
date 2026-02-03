@@ -11,7 +11,6 @@ const supabaseAdmin = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Simple protection so this endpoint cannot be abused
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 export default async function handler(req, res) {
@@ -35,32 +34,31 @@ export default async function handler(req, res) {
     if (fetchError) throw fetchError;
 
     if (!rows || rows.length === 0) {
-      return res.status(200).json({
-        message: "No rows need embedding. All good."
-      });
+      return res.status(200).json({ message: "No rows need embedding. All good." });
     }
 
     // 2) Create embeddings using OpenAI
     const embeddingResponse = await openai.embeddings.create({
       model: "text-embedding-3-small",
-      input: rows.map(r => r.content)
+      input: rows.map((r) => r.content)
     });
 
-    // 3) Save embeddings back to Supabase
-    const updates = rows.map((row, index) => ({
-      id: row.id,
-      embedding: embeddingResponse.data[index].embedding
-    }));
+    // 3) Update each row (NO upsert)
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const embedding = embeddingResponse.data[i].embedding;
 
-    const { error: updateError } = await supabaseAdmin
-      .from("kb_chunks")
-      .upsert(updates, { onConflict: "id" });
+      const { error: updateError } = await supabaseAdmin
+        .from("kb_chunks")
+        .update({ embedding })
+        .eq("id", row.id);
 
-    if (updateError) throw updateError;
+      if (updateError) throw updateError;
+    }
 
     return res.status(200).json({
       success: true,
-      embedded_rows: updates.length
+      embedded_rows: rows.length
     });
 
   } catch (err) {
