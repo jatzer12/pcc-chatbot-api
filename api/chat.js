@@ -276,7 +276,7 @@ export default async function handler(req, res) {
     const messagesForModel = [SYSTEM_MESSAGE, kbSystemMessage, ...userMessages];
 
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       messages: messagesForModel,
       temperature: 0.2
     });
