@@ -1,16 +1,21 @@
 import OpenAI from "openai";
 
 /**
- * PCC Chatbot API (GitHub KB version) — Hardened
+ * PCC Chatbot API (GitHub KB version) — Hardened (Copy/Paste)
  * - Reads KB files from jatzer12/PCC-Chatbot/kb/
  * - Retrieves relevant snippets (keyword-based)
  * - ✅ VERBATIM BYPASS for Mission/Vision/Motto (no model)
  * - ✅ Prevents user "dictating" org facts (trust hierarchy)
  * - ✅ Trims history to reduce contamination
+ * - ✅ Adds basic validation + rate limit + safer mission trigger + CORS (prod + local)
  */
 
 /** ---------- Config ---------- */
-const ALLOWED_ORIGIN = "https://jatzer12.github.io";
+const ALLOWED_ORIGINS = new Set([
+  "https://jatzer12.github.io",
+  "http://localhost:5500",
+  "http://127.0.0.1:5500"
+]);
 
 const ESCALATION_PHONE = "808-293-3160";
 const ESCALATION_EMAIL = "mis@polynesia.com";
@@ -24,11 +29,44 @@ let KB_CACHE = null;
 let KB_CACHE_AT = 0;
 const KB_TTL_MS = 5 * 60 * 1000;
 
+/** ---------- Request limits (cost + abuse control) ---------- */
+const MAX_MESSAGES_IN = 30;
+const MAX_CONTENT_CHARS = 2000;
+const MAX_HISTORY_FOR_MODEL = 12; // user/assistant messages only (no system)
+
+/** ---------- Simple in-memory rate limiter (per Vercel instance) ---------- */
+const RATE_WINDOW_MS = 60_000; // 1 min
+const RATE_MAX = 30; // requests per minute per IP
+const rateMap = new Map();
+
+function rateLimit(ip) {
+  const now = Date.now();
+  const item = rateMap.get(ip) || { count: 0, resetAt: now + RATE_WINDOW_MS };
+  if (now > item.resetAt) {
+    item.count = 0;
+    item.resetAt = now + RATE_WINDOW_MS;
+  }
+  item.count += 1;
+  rateMap.set(ip, item);
+  return item.count <= RATE_MAX;
+}
+
 /** ---------- OpenAI Client (lazy init so missing env is reported cleanly) ---------- */
 function getOpenAIClient() {
   const key = process.env.OPENAI_API_KEY;
   if (!key) return null;
   return new OpenAI({ apiKey: key });
+}
+
+/** ---------- CORS helper ---------- */
+function setCors(req, res) {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
 /** ---------- System Instructions ---------- */
@@ -111,7 +149,7 @@ function chunkText(text, chunkSize = 900, overlap = 150) {
   let i = 0;
   while (i < s.length) {
     out.push(s.slice(i, i + chunkSize).trim());
-    i += (chunkSize - overlap);
+    i += chunkSize - overlap;
   }
   return out.filter(Boolean);
 }
@@ -128,7 +166,7 @@ function scoreChunk(queryTokens, chunk) {
 
 async function loadKB() {
   const now = Date.now();
-  if (KB_CACHE && (now - KB_CACHE_AT) < KB_TTL_MS) return KB_CACHE;
+  if (KB_CACHE && now - KB_CACHE_AT < KB_TTL_MS) return KB_CACHE;
 
   const idxUrl = `${RAW_BASE}/kb/index.json`;
   const idxRes = await fetch(idxUrl);
@@ -144,6 +182,7 @@ async function loadKB() {
   const idx = await idxRes.json();
   const docs = [];
 
+  // NOTE: This fetches sequentially. (OK for small KB. If KB grows, we can parallelize.)
   for (const f of idx.files || []) {
     const fileUrl = `${RAW_BASE}/${f.path}`;
     const r = await fetch(fileUrl);
@@ -181,18 +220,19 @@ function retrieveSnippets(query, docs, topK = 5) {
     .slice(0, topK);
 }
 
-/** ---------- VERBATIM BYPASS: Mission/Vision/Motto ---------- */
+/** ---------- VERBATIM BYPASS: Mission/Vision/Motto (safer trigger) ---------- */
 function isMissionVisionMotto(text = "") {
   const t = String(text).toLowerCase();
-  return (
-    t.includes("mission") ||
-    t.includes("vision") ||
-    t.includes("motto") ||
-    t.includes("mission vision") ||
-    t.includes("mission, vision") ||
-    t.includes("mission statement") ||
-    t.includes("vision statement")
-  );
+
+  const asksForStatement =
+    /(what( is|'s)|show|give|tell|provide|share)\s+(me\s+)?(the\s+)?(pcc\s+)?(mission|vision|motto)(\s+statement)?/.test(t) ||
+    /(pcc)\s+(mission|vision|motto)/.test(t) ||
+    /(mission|vision|motto)\s+of\s+(pcc|polynesian cultural center)/.test(t);
+
+  const obviousNonOrgUse =
+    /mission trip|missionary|vision test|vision problem|television|cctv|night vision/.test(t);
+
+  return asksForStatement && !obviousNonOrgUse;
 }
 
 async function fetchRawFile(filePath) {
@@ -206,21 +246,48 @@ async function fetchRawFile(filePath) {
 }
 
 /** ---------- History trimming (reduces user "fact injection") ---------- */
-function trimHistoryForModel(userMessages, maxMessages = 12) {
-  // keep only the most recent N user/assistant messages (no system)
+function trimHistoryForModel(userMessages, maxMessages = MAX_HISTORY_FOR_MODEL) {
   return userMessages.slice(-maxMessages);
+}
+
+/** ---------- Input validation ---------- */
+function validateIncomingMessages(incomingMessages) {
+  if (!Array.isArray(incomingMessages)) return { ok: true };
+
+  if (incomingMessages.length > MAX_MESSAGES_IN) {
+    return { ok: false, error: "Too many messages." };
+  }
+
+  for (const m of incomingMessages) {
+    if (!m || typeof m !== "object") return { ok: false, error: "Invalid message format." };
+    if (!["user", "assistant", "system"].includes(m.role)) {
+      return { ok: false, error: "Invalid message role." };
+    }
+    const c = String(m.content ?? "");
+    if (!c.trim()) return { ok: false, error: "Empty message content." };
+    if (c.length > MAX_CONTENT_CHARS) return { ok: false, error: "Message too long." };
+  }
+
+  return { ok: true };
 }
 
 /** ---------- Handler ---------- */
 export default async function handler(req, res) {
   // CORS
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // Rate limit
+  const ip =
+    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "unknown";
+
+  if (!rateLimit(ip)) {
+    return res.status(429).json({ error: "Too many requests. Please try again shortly." });
+  }
 
   try {
     const openai = getOpenAIClient();
@@ -236,19 +303,29 @@ export default async function handler(req, res) {
     const incomingMessages = Array.isArray(body.messages) ? body.messages : null;
     const fallbackMessage = typeof body.message === "string" ? body.message : "";
 
-    const rawUserMessages =
-      (incomingMessages && incomingMessages.length)
-        ? incomingMessages.filter(m => m && m.role && m.content && m.role !== "system")
-        : [{ role: "user", content: fallbackMessage }];
+    // Validate input
+    const v = validateIncomingMessages(incomingMessages);
+    if (!v.ok) return res.status(400).json({ error: v.error });
 
-    const userMessages = trimHistoryForModel(rawUserMessages, 12);
+    // Only accept non-system messages from user input (server controls system)
+    const rawUserMessages =
+      incomingMessages && incomingMessages.length
+        ? incomingMessages.filter(m => m && m.role && m.content && m.role !== "system")
+        : fallbackMessage
+          ? [{ role: "user", content: fallbackMessage }]
+          : [];
+
+    const userMessages = trimHistoryForModel(rawUserMessages, MAX_HISTORY_FOR_MODEL);
 
     const latestUser = [...userMessages].reverse().find(m => m.role === "user");
     const latestUserText = latestUser?.content ? String(latestUser.content) : "";
 
+    if (!latestUserText.trim()) {
+      return res.status(400).json({ error: "No user message provided." });
+    }
+
     /** ✅ 1) VERBATIM Mission/Vision/Motto bypass */
     if (isMissionVisionMotto(latestUserText)) {
-      // We return the KB file word-for-word (no OpenAI call)
       const missionText = await fetchRawFile("kb/pcc-mission.md");
       return res.status(200).json({ reply: missionText.trim() });
     }
@@ -281,13 +358,16 @@ export default async function handler(req, res) {
       temperature: 0.2
     });
 
-    const reply = completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
+    const reply =
+      completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
+
     return res.status(200).json({ reply });
   } catch (err) {
     console.error("API crash:", err);
     return res.status(500).json({
       error: err?.message || "Server error",
-      hint: "Check Vercel logs. Most common causes: missing OPENAI_API_KEY, or KB files not reachable via GitHub RAW."
+      hint:
+        "Check Vercel logs. Most common causes: missing OPENAI_API_KEY, or KB files not reachable via GitHub RAW."
     });
   }
 }
