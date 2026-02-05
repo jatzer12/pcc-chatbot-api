@@ -1,13 +1,12 @@
 import OpenAI from "openai";
 
 /**
- * PCC Chatbot API (GitHub KB version) — Hardened (Copy/Paste)
- * - Reads KB files from jatzer12/PCC-Chatbot/kb/
- * - Retrieves relevant snippets (keyword-based)
- * - ✅ VERBATIM BYPASS for Mission/Vision/Motto (no model)
- * - ✅ Prevents user "dictating" org facts (trust hierarchy)
- * - ✅ Trims history to reduce contamination
- * - ✅ Adds basic validation + rate limit + safer mission trigger + CORS (prod + local)
+ * api/chat.js — hardened copy (drop-in)
+ *
+ * Notes:
+ * - Temporary DEBUG_CORS_ALLOW_ALL = true to help you test quickly.
+ * - Will return clearer error text to the frontend (so you can see the failure message).
+ * - Keep an eye on Vercel server logs for the printed error details.
  */
 
 /** ---------- Config ---------- */
@@ -16,6 +15,9 @@ const ALLOWED_ORIGINS = new Set([
   "http://localhost:5500",
   "http://127.0.0.1:5500"
 ]);
+
+// Set to true while debugging. After you confirm the widget works, set to false.
+const DEBUG_CORS_ALLOW_ALL = true;
 
 const ESCALATION_PHONE = "808-293-3160";
 const ESCALATION_EMAIL = "mis@polynesia.com";
@@ -61,9 +63,16 @@ function getOpenAIClient() {
 /** ---------- CORS helper ---------- */
 function setCors(req, res) {
   const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
+  if (DEBUG_CORS_ALLOW_ALL) {
+    // For quick debugging only — allow the request origin (or '*')
+    if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+    else res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Vary", "Origin");
+  } else {
+    if (origin && ALLOWED_ORIGINS.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
   }
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -165,50 +174,55 @@ function scoreChunk(queryTokens, chunk) {
 }
 
 async function loadKB() {
-  const now = Date.now();
-  if (KB_CACHE && now - KB_CACHE_AT < KB_TTL_MS) return KB_CACHE;
+  try {
+    const now = Date.now();
+    if (KB_CACHE && now - KB_CACHE_AT < KB_TTL_MS) return KB_CACHE;
 
-  const idxUrl = `${RAW_BASE}/kb/index.json`;
-  const idxRes = await fetch(idxUrl);
+    const idxUrl = `${RAW_BASE}/kb/index.json`;
+    const idxRes = await fetch(idxUrl);
 
-  if (!idxRes.ok) {
-    const body = await idxRes.text().catch(() => "");
-    console.error("KB index fetch failed:", idxUrl, idxRes.status, body.slice(0, 200));
-    KB_CACHE = [];
-    KB_CACHE_AT = now;
-    return KB_CACHE;
-  }
-
-  const idx = await idxRes.json();
-  const docs = [];
-
-  // NOTE: This fetches sequentially. (OK for small KB. If KB grows, we can parallelize.)
-  for (const f of idx.files || []) {
-    const fileUrl = `${RAW_BASE}/${f.path}`;
-    const r = await fetch(fileUrl);
-
-    if (!r.ok) {
-      const body = await r.text().catch(() => "");
-      console.error("KB file fetch failed:", fileUrl, r.status, body.slice(0, 200));
-      continue;
+    if (!idxRes.ok) {
+      const body = await idxRes.text().catch(() => "");
+      console.error("KB index fetch failed:", idxUrl, idxRes.status, body.slice(0, 200));
+      KB_CACHE = [];
+      KB_CACHE_AT = now;
+      return KB_CACHE;
     }
 
-    const text = await r.text();
-    const chunks = chunkText(text);
+    const idx = await idxRes.json();
+    const docs = [];
 
-    chunks.forEach((ch, i) => {
-      docs.push({
-        id: `${f.id}#${i}`,
-        title: f.title || f.id,
-        text: ch,
-        path: f.path
+    for (const f of idx.files || []) {
+      const fileUrl = `${RAW_BASE}/${f.path}`;
+      const r = await fetch(fileUrl);
+
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        console.error("KB file fetch failed:", fileUrl, r.status, body.slice(0, 200));
+        continue;
+      }
+
+      const text = await r.text();
+      const chunks = chunkText(text);
+
+      chunks.forEach((ch, i) => {
+        docs.push({
+          id: `${f.id}#${i}`,
+          title: f.title || f.id,
+          text: ch,
+          path: f.path
+        });
       });
-    });
-  }
+    }
 
-  KB_CACHE = docs;
-  KB_CACHE_AT = now;
-  return docs;
+    KB_CACHE = docs;
+    KB_CACHE_AT = now;
+    return docs;
+  } catch (err) {
+    console.error("loadKB error:", err);
+    // Don't throw — return empty docs so the bot can still answer (with "none found")
+    return [];
+  }
 }
 
 function retrieveSnippets(query, docs, topK = 5) {
@@ -273,13 +287,11 @@ function validateIncomingMessages(incomingMessages) {
 
 /** ---------- Handler ---------- */
 export default async function handler(req, res) {
-  // CORS
   setCors(req, res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  // Rate limit
   const ip =
     (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
     req.socket?.remoteAddress ||
@@ -292,22 +304,22 @@ export default async function handler(req, res) {
   try {
     const openai = getOpenAIClient();
     if (!openai) {
-      return res.status(500).json({
-        error: "Missing OPENAI_API_KEY in Vercel environment variables."
-      });
+      console.error("Missing OPENAI_API_KEY");
+      return res.status(500).json({ error: "Missing OPENAI_API_KEY in Vercel environment variables." });
     }
 
     const body = req.body || {};
 
-    // Frontend sends { messages }
     const incomingMessages = Array.isArray(body.messages) ? body.messages : null;
     const fallbackMessage = typeof body.message === "string" ? body.message : "";
 
     // Validate input
     const v = validateIncomingMessages(incomingMessages);
-    if (!v.ok) return res.status(400).json({ error: v.error });
+    if (!v.ok) {
+      console.warn("Validation failed:", v.error);
+      return res.status(400).json({ error: v.error });
+    }
 
-    // Only accept non-system messages from user input (server controls system)
     const rawUserMessages =
       incomingMessages && incomingMessages.length
         ? incomingMessages.filter(m => m && m.role && m.content && m.role !== "system")
@@ -324,14 +336,22 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "No user message provided." });
     }
 
-    /** ✅ 1) VERBATIM Mission/Vision/Motto bypass */
+    // VERBATIM bypass
     if (isMissionVisionMotto(latestUserText)) {
-      const missionText = await fetchRawFile("kb/pcc-mission.md");
-      return res.status(200).json({ reply: missionText.trim() });
+      try {
+        const missionText = await fetchRawFile("kb/pcc-mission.md");
+        return res.status(200).json({ reply: missionText.trim() });
+      } catch (err) {
+        console.error("Mission fetch failed:", err);
+        return res.status(500).json({ error: "Failed to read mission file: " + (err.message || String(err)) });
+      }
     }
 
-    /** Normal KB retrieval */
-    const kbDocs = await loadKB();
+    // Normal KB retrieval (defensive)
+    const kbDocs = await loadKB().catch(err => {
+      console.error("loadKB failed:", err);
+      return [];
+    });
     const hits = latestUserText ? retrieveSnippets(latestUserText, kbDocs, 5) : [];
 
     const kbBlock = hits.length
@@ -352,16 +372,25 @@ export default async function handler(req, res) {
 
     const messagesForModel = [SYSTEM_MESSAGE, kbSystemMessage, ...userMessages];
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: messagesForModel,
-      temperature: 0.2
-    });
+    // Call OpenAI — wrap in try/catch and return the error message to frontend for debugging
+    try {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: messagesForModel,
+        temperature: 0.2
+      });
 
-    const reply =
-      completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
+      const reply =
+        completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
 
-    return res.status(200).json({ reply });
+      return res.status(200).json({ reply });
+    } catch (err) {
+      // This is the important debug response — surfaces the model / permission / network error.
+      console.error("OpenAI call failed:", err);
+      const msg = err?.message || "OpenAI call failed";
+      // If the error object has a statusCode or body, include it (safe for debugging)
+      return res.status(500).json({ error: `OpenAI error: ${msg}` });
+    }
   } catch (err) {
     console.error("API crash:", err);
     return res.status(500).json({
