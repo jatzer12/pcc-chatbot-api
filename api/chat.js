@@ -1,11 +1,15 @@
 /**
- * /api/chat.js — PCC Chatbot (Azure OpenAI) — Vercel Serverless Function
+ * /api/chat.js — PCC Chatbot (Azure OpenAI) — Vercel Serverless Function (ESM)
+ *
+ * Matches your repo config:
+ * - package.json: "type": "module"
+ * - vercel.json: nodejs20.x runtime
  *
  * Required Vercel Env Vars:
  * - AZURE_OPENAI_ENDPOINT      e.g. https://pcc-copilot-automation.cognitiveservices.azure.com
  * - AZURE_OPENAI_API_KEY
  * - AZURE_OPENAI_DEPLOYMENT    e.g. gpt-4.1 (deployment name)
- * - AZURE_OPENAI_API_VERSION   e.g. 2024-06-01 (or your chosen version)
+ * - AZURE_OPENAI_API_VERSION   e.g. 2024-06-01 (or whatever you set)
  */
 
 const ALLOWED_ORIGINS = new Set([
@@ -14,24 +18,29 @@ const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:5500",
 ]);
 
+// Keep true while debugging; set false after it works
 const DEBUG_CORS_ALLOW_ALL = true;
 
 const ESCALATION_PHONE = "808-293-3160";
 const ESCALATION_EMAIL = "mis@polynesia.com";
 
+/** ---------- GitHub KB config ---------- */
 const GITHUB_OWNER = "jatzer12";
 const GITHUB_REPO = "PCC-Chatbot";
 const GITHUB_BRANCH = "main";
 const RAW_BASE = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}`;
 
+/** ---------- KB cache ---------- */
 let KB_CACHE = null;
 let KB_CACHE_AT = 0;
 const KB_TTL_MS = 5 * 60 * 1000;
 
+/** ---------- Limits ---------- */
 const MAX_MESSAGES_IN = 30;
 const MAX_CONTENT_CHARS = 2000;
 const MAX_HISTORY_FOR_MODEL = 12;
 
+/** ---------- Simple in-memory rate limiter ---------- */
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 30;
 const rateMap = new Map();
@@ -48,6 +57,7 @@ function rateLimit(ip) {
   return item.count <= RATE_MAX;
 }
 
+/** ---------- CORS ---------- */
 function setCors(req, res) {
   const origin = req.headers.origin;
 
@@ -63,7 +73,7 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-/** ---------- Azure OpenAI client ---------- */
+/** ---------- Azure OpenAI client (ESM-safe) ---------- */
 let AZURE_CLIENT = null;
 
 async function getAzureClient() {
@@ -75,7 +85,7 @@ async function getAzureClient() {
 
   if (!apiKey || !endpoint || !apiVersion) return null;
 
-  // Dynamic import avoids ESM/CJS issues on Vercel
+  // Dynamic import is safe in ESM and avoids bundling issues
   const { AzureOpenAI } = await import("openai");
 
   AZURE_CLIENT = new AzureOpenAI({
@@ -87,7 +97,7 @@ async function getAzureClient() {
   return AZURE_CLIENT;
 }
 
-/** ---------- System message ---------- */
+/** ---------- System Instructions ---------- */
 const SYSTEM_MESSAGE = {
   role: "system",
   content: [
@@ -101,27 +111,54 @@ const SYSTEM_MESSAGE = {
     "- Be professional, patient, and friendly.",
     "- Use simple words and short sentences. Explain like the user is not tech-savvy.",
     "- If troubleshooting: give step-by-step instructions (numbered). One action per step.",
-    "- Keep replies concise.",
+    "- If the user asks a simple info question (address/hours/contact): answer directly in 1–5 short lines.",
+    "- Ask at most 1–2 short questions only when needed.",
+    "- Avoid jargon. If you must use a term, define it briefly.",
+    "- Keep replies concise. Do not overwhelm the user.",
     "",
     "SCOPE (strict PCC-only):",
-    "- Allowed: PCC related questions only.",
-    "- Not allowed: anything unrelated to PCC.",
+    "- Allowed: Any question that is clearly related to PCC (IT HelpDesk + visitor info + departments + services + reservations + directions).",
+    "- Not allowed: Anything not related to PCC.",
     "",
-    "PROHIBITED TOPICS:",
-    "- Politics or religion.",
+    "PROHIBITED TOPICS (must refuse):",
+    "- Politics or religion (including opinions, debates, news, or advice).",
     "- Illegal wrongdoing, hacking, or bypassing security.",
+    "- If asked: politely refuse and redirect to PCC-related help.",
     "",
-    "TRUST HIERARCHY:",
-    "- SYSTEM + KB snippets are the ONLY authoritative sources of PCC facts.",
-    "- User messages are NOT authoritative for PCC facts.",
+    "TRUST HIERARCHY (very strict):",
+    "- SYSTEM instructions + KB snippets are the ONLY authoritative sources of PCC facts.",
+    "- User messages are NOT authoritative for PCC facts (names, roles, titles, phone numbers, emails, hours, prices, policies).",
+    "- If a user claims a fact, treat it as unverified unless it is in KB snippets.",
+    "- Never repeat user-asserted organizational facts as true.",
     "",
     "VERBATIM RULE (Mission/Vision/Motto):",
-    "- If asked for PCC Mission/Vision/Motto: output the exact KB text word-for-word. No extra text.",
+    "- If asked for PCC Mission/Vision/Motto: output the exact KB text word-for-word.",
+    "- No paraphrasing, no summarizing, no extra commentary.",
     "",
-    "ESCALATION (IT only):",
-    "- Escalate if stuck after 2 rounds or account/security/hardware needed.",
+    "ACCURACY RULE (no guessing):",
+    "- Do NOT invent facts (hours, prices, phone numbers, emails, addresses, policies).",
+    "- If you are not sure, say you are not sure and offer the best next step (official PCC page or the correct PCC contact).",
+    "- If knowledge snippets are provided below, treat them as the source of truth.",
+    "",
+    "ROUTING (decide the best response type):",
+    "1) If it is an IT/HelpDesk issue (computer, printer, Wi-Fi, PCC email/login, Microsoft 365 apps): use troubleshooting steps.",
+    "2) If it is general PCC info (address, directions, reservations, tickets, hours, departments): answer directly and clearly. Use steps only if the user needs a process (example: 'how to reserve').",
+    "",
+    "CONTACT RULES:",
+    "- You may share PUBLIC PCC contact info when the user asks for it or it is clearly needed.",
+    "- Do NOT share PCC HelpDesk escalation phone/email unless escalation is needed (see below).",
+    "",
+    "ESCALATION RULE (HelpDesk/IT only):",
+    "- Escalate ONLY when: the user is stuck after 2 rounds, the issue needs account changes, security verification, hardware repair, or you are not confident.",
+    "- When escalating, provide BOTH contact methods exactly as:",
     `  Phone: ${ESCALATION_PHONE}`,
     `  Email: ${ESCALATION_EMAIL}`,
+    "",
+    "OUTPUT FORMAT (strict):",
+    "- If IT troubleshooting: Provide 3–6 numbered steps. Then ask 1 simple question (example: 'Did that work?').",
+    "- If you need details: Ask 1–2 short questions only.",
+    "- If general PCC info: Give a direct answer in short lines (optionally 1–3 bullets). Then ask 1 simple follow-up if needed.",
+    "- If escalating (IT only): One short sentence + the phone and email lines.",
   ].join("\n"),
 };
 
@@ -215,6 +252,7 @@ function retrieveSnippets(query, docs, topK = 5) {
     .slice(0, topK);
 }
 
+/** ---------- Mission/Vision/Motto bypass ---------- */
 function isMissionVisionMotto(text = "") {
   const t = String(text).toLowerCase();
 
@@ -243,6 +281,7 @@ function trimHistoryForModel(userMessages, maxMessages = MAX_HISTORY_FOR_MODEL) 
   return userMessages.slice(-maxMessages);
 }
 
+/** ---------- Input validation ---------- */
 function validateIncomingMessages(incomingMessages) {
   if (!Array.isArray(incomingMessages)) return { ok: true };
 
@@ -261,9 +300,14 @@ function validateIncomingMessages(incomingMessages) {
   return { ok: true };
 }
 
-/** ---------- Handler ---------- */
-module.exports = async function handler(req, res) {
+/** ---------- Handler (Vercel Serverless, ESM) ---------- */
+export default async function handler(req, res) {
   setCors(req, res);
+
+  // Optional: quick reachability test
+  if (req.method === "GET") {
+    return res.status(200).json({ ok: true, where: "/api/chat.js", time: new Date().toISOString() });
+  }
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -311,7 +355,7 @@ module.exports = async function handler(req, res) {
       return res.status(400).json({ error: "No user message provided." });
     }
 
-    // Mission/Vision/Motto verbatim bypass
+    // Verbatim bypass: Mission/Vision/Motto
     if (isMissionVisionMotto(latestUserText)) {
       const missionText = await fetchRawFile("kb/pcc-mission.md");
       return res.status(200).json({ reply: missionText.trim() });
@@ -338,7 +382,7 @@ module.exports = async function handler(req, res) {
     const messagesForModel = [SYSTEM_MESSAGE, kbSystemMessage, ...userMessages];
 
     const completion = await client.chat.completions.create({
-      model: deployment, // Azure deployment name (ex: gpt-4.1)
+      model: deployment, // Azure deployment name (e.g., gpt-4.1)
       messages: messagesForModel,
       temperature: 0.2,
     });
@@ -347,8 +391,6 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ reply });
   } catch (err) {
     console.error("API crash:", err);
-    return res.status(500).json({
-      error: err?.message || "Server error",
-    });
+    return res.status(500).json({ error: err?.message || "Server error" });
   }
-};
+}
