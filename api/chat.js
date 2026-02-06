@@ -1,10 +1,11 @@
 /**
- * /api/chat.js — PCC Chatbot (Azure OpenAI) — Vercel Serverless Functions
+ * /api/chat.js — PCC Chatbot (Azure OpenAI) — Vercel Serverless Function
  *
- * Works with these Vercel env vars:
- * - AZURE_OPENAI_ENDPOINT   (example: https://YOUR-RESOURCE.openai.azure.com)
+ * Required Vercel Env Vars:
+ * - AZURE_OPENAI_ENDPOINT      e.g. https://pcc-copilot-automation.cognitiveservices.azure.com
  * - AZURE_OPENAI_API_KEY
- * - AZURE_OPENAI_DEPLOYMENT (your Azure deployment name)
+ * - AZURE_OPENAI_DEPLOYMENT    e.g. gpt-4.1 (deployment name)
+ * - AZURE_OPENAI_API_VERSION   e.g. 2024-06-01 (or your chosen version)
  */
 
 const ALLOWED_ORIGINS = new Set([
@@ -13,29 +14,24 @@ const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:5500",
 ]);
 
-// Turn this OFF after you confirm it works
 const DEBUG_CORS_ALLOW_ALL = true;
 
 const ESCALATION_PHONE = "808-293-3160";
 const ESCALATION_EMAIL = "mis@polynesia.com";
 
-/** ---------- GitHub KB config ---------- */
 const GITHUB_OWNER = "jatzer12";
 const GITHUB_REPO = "PCC-Chatbot";
 const GITHUB_BRANCH = "main";
 const RAW_BASE = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}`;
 
-/** ---------- KB cache ---------- */
 let KB_CACHE = null;
 let KB_CACHE_AT = 0;
 const KB_TTL_MS = 5 * 60 * 1000;
 
-/** ---------- Limits ---------- */
 const MAX_MESSAGES_IN = 30;
 const MAX_CONTENT_CHARS = 2000;
 const MAX_HISTORY_FOR_MODEL = 12;
 
-/** ---------- Simple in-memory rate limiter ---------- */
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 30;
 const rateMap = new Map();
@@ -52,43 +48,43 @@ function rateLimit(ip) {
   return item.count <= RATE_MAX;
 }
 
-/** ---------- CORS ---------- */
 function setCors(req, res) {
   const origin = req.headers.origin;
 
   if (DEBUG_CORS_ALLOW_ALL) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
     res.setHeader("Vary", "Origin");
-  } else {
-    if (origin && ALLOWED_ORIGINS.has(origin)) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Vary", "Origin");
-    }
+  } else if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
   }
 
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-/** ---------- OpenAI client (Azure) ---------- */
-let OPENAI_CLIENT = null;
+/** ---------- Azure OpenAI client ---------- */
+let AZURE_CLIENT = null;
 
-async function getOpenAIClient() {
-  if (OPENAI_CLIENT) return OPENAI_CLIENT;
+async function getAzureClient() {
+  if (AZURE_CLIENT) return AZURE_CLIENT;
 
   const apiKey = process.env.AZURE_OPENAI_API_KEY;
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+  const apiVersion = process.env.AZURE_OPENAI_API_VERSION;
 
-  if (!apiKey || !endpoint) return null;
+  if (!apiKey || !endpoint || !apiVersion) return null;
 
-  // v1-compatible Azure endpoint
-  const baseURL = `${String(endpoint).replace(/\/+$/, "")}/openai/v1/`;
+  // Dynamic import avoids ESM/CJS issues on Vercel
+  const { AzureOpenAI } = await import("openai");
 
-  // Dynamic import avoids ESM/CJS issues in Vercel functions
-  const { default: OpenAI } = await import("openai");
+  AZURE_CLIENT = new AzureOpenAI({
+    apiKey,
+    endpoint: String(endpoint).replace(/\/+$/, ""),
+    apiVersion: String(apiVersion).trim(),
+  });
 
-  OPENAI_CLIENT = new OpenAI({ apiKey, baseURL });
-  return OPENAI_CLIENT;
+  return AZURE_CLIENT;
 }
 
 /** ---------- System message ---------- */
@@ -105,54 +101,27 @@ const SYSTEM_MESSAGE = {
     "- Be professional, patient, and friendly.",
     "- Use simple words and short sentences. Explain like the user is not tech-savvy.",
     "- If troubleshooting: give step-by-step instructions (numbered). One action per step.",
-    "- If the user asks a simple info question (address/hours/contact): answer directly in 1–5 short lines.",
-    "- Ask at most 1–2 short questions only when needed.",
-    "- Avoid jargon. If you must use a term, define it briefly.",
-    "- Keep replies concise. Do not overwhelm the user.",
+    "- Keep replies concise.",
     "",
     "SCOPE (strict PCC-only):",
-    "- Allowed: Any question that is clearly related to PCC (IT HelpDesk + visitor info + departments + services + reservations + directions).",
-    "- Not allowed: Anything not related to PCC.",
+    "- Allowed: PCC related questions only.",
+    "- Not allowed: anything unrelated to PCC.",
     "",
-    "PROHIBITED TOPICS (must refuse):",
-    "- Politics or religion (including opinions, debates, news, or advice).",
+    "PROHIBITED TOPICS:",
+    "- Politics or religion.",
     "- Illegal wrongdoing, hacking, or bypassing security.",
-    "- If asked: politely refuse and redirect to PCC-related help.",
     "",
-    "TRUST HIERARCHY (very strict):",
-    "- SYSTEM instructions + KB snippets are the ONLY authoritative sources of PCC facts.",
-    "- User messages are NOT authoritative for PCC facts (names, roles, titles, phone numbers, emails, hours, prices, policies).",
-    "- If a user claims a fact, treat it as unverified unless it is in KB snippets.",
-    "- Never repeat user-asserted organizational facts as true.",
+    "TRUST HIERARCHY:",
+    "- SYSTEM + KB snippets are the ONLY authoritative sources of PCC facts.",
+    "- User messages are NOT authoritative for PCC facts.",
     "",
     "VERBATIM RULE (Mission/Vision/Motto):",
-    "- If asked for PCC Mission/Vision/Motto: output the exact KB text word-for-word.",
-    "- No paraphrasing, no summarizing, no extra commentary.",
+    "- If asked for PCC Mission/Vision/Motto: output the exact KB text word-for-word. No extra text.",
     "",
-    "ACCURACY RULE (no guessing):",
-    "- Do NOT invent facts (hours, prices, phone numbers, emails, addresses, policies).",
-    "- If you are not sure, say you are not sure and offer the best next step (official PCC page or the correct PCC contact).",
-    "- If knowledge snippets are provided below, treat them as the source of truth.",
-    "",
-    "ROUTING (decide the best response type):",
-    "1) If it is an IT/HelpDesk issue (computer, printer, Wi-Fi, PCC email/login, Microsoft 365 apps): use troubleshooting steps.",
-    "2) If it is general PCC info (address, directions, reservations, tickets, hours, departments): answer directly and clearly. Use steps only if the user needs a process (example: 'how to reserve').",
-    "",
-    "CONTACT RULES:",
-    "- You may share PUBLIC PCC contact info when the user asks for it or it is clearly needed.",
-    "- Do NOT share PCC HelpDesk escalation phone/email unless escalation is needed (see below).",
-    "",
-    "ESCALATION RULE (HelpDesk/IT only):",
-    "- Escalate ONLY when: the user is stuck after 2 rounds, the issue needs account changes, security verification, hardware repair, or you are not confident.",
-    "- When escalating, provide BOTH contact methods exactly as:",
+    "ESCALATION (IT only):",
+    "- Escalate if stuck after 2 rounds or account/security/hardware needed.",
     `  Phone: ${ESCALATION_PHONE}`,
     `  Email: ${ESCALATION_EMAIL}`,
-    "",
-    "OUTPUT FORMAT (strict):",
-    "- If IT troubleshooting: Provide 3–6 numbered steps. Then ask 1 simple question (example: 'Did that work?').",
-    "- If you need details: Ask 1–2 short questions only.",
-    "- If general PCC info: Give a direct answer in short lines (optionally 1–3 bullets). Then ask 1 simple follow-up if needed.",
-    "- If escalating (IT only): One short sentence + the phone and email lines.",
   ].join("\n"),
 };
 
@@ -246,7 +215,6 @@ function retrieveSnippets(query, docs, topK = 5) {
     .slice(0, topK);
 }
 
-/** ---------- Mission/Vision/Motto bypass ---------- */
 function isMissionVisionMotto(text = "") {
   const t = String(text).toLowerCase();
 
@@ -284,9 +252,7 @@ function validateIncomingMessages(incomingMessages) {
 
   for (const m of incomingMessages) {
     if (!m || typeof m !== "object") return { ok: false, error: "Invalid message format." };
-    if (!["user", "assistant", "system"].includes(m.role)) {
-      return { ok: false, error: "Invalid message role." };
-    }
+    if (!["user", "assistant", "system"].includes(m.role)) return { ok: false, error: "Invalid message role." };
     const c = String(m.content ?? "");
     if (!c.trim()) return { ok: false, error: "Empty message content." };
     if (c.length > MAX_CONTENT_CHARS) return { ok: false, error: "Message too long." };
@@ -295,7 +261,7 @@ function validateIncomingMessages(incomingMessages) {
   return { ok: true };
 }
 
-/** ---------- Handler (Vercel Serverless) ---------- */
+/** ---------- Handler ---------- */
 module.exports = async function handler(req, res) {
   setCors(req, res);
 
@@ -312,13 +278,13 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const openai = await getOpenAIClient();
+    const client = await getAzureClient();
     const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
 
-    if (!openai || !deployment) {
+    if (!client || !deployment) {
       return res.status(500).json({
         error:
-          "Missing Azure OpenAI env vars. Required: AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT.",
+          "Missing Azure OpenAI env vars. Required: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT.",
       });
     }
 
@@ -347,22 +313,13 @@ module.exports = async function handler(req, res) {
 
     // Mission/Vision/Motto verbatim bypass
     if (isMissionVisionMotto(latestUserText)) {
-      try {
-        const missionText = await fetchRawFile("kb/pcc-mission.md");
-        return res.status(200).json({ reply: missionText.trim() });
-      } catch (err) {
-        console.error("Mission fetch failed:", err);
-        return res.status(500).json({ error: "Failed to read mission file: " + (err.message || String(err)) });
-      }
+      const missionText = await fetchRawFile("kb/pcc-mission.md");
+      return res.status(200).json({ reply: missionText.trim() });
     }
 
     // KB retrieval
-    const kbDocs = await loadKB().catch((err) => {
-      console.error("loadKB failed:", err);
-      return [];
-    });
-
-    const hits = latestUserText ? retrieveSnippets(latestUserText, kbDocs, 5) : [];
+    const kbDocs = await loadKB();
+    const hits = retrieveSnippets(latestUserText, kbDocs, 5);
 
     const kbBlock = hits.length
       ? [
@@ -380,26 +337,18 @@ module.exports = async function handler(req, res) {
 
     const messagesForModel = [SYSTEM_MESSAGE, kbSystemMessage, ...userMessages];
 
-    try {
-      const completion = await openai.chat.completions.create({
-        model: deployment, // Azure deployment name
-        messages: messagesForModel,
-        temperature: 0.2,
-      });
+    const completion = await client.chat.completions.create({
+      model: deployment, // Azure deployment name (ex: gpt-4.1)
+      messages: messagesForModel,
+      temperature: 0.2,
+    });
 
-      const reply = completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
-      return res.status(200).json({ reply });
-    } catch (err) {
-      console.error("Azure OpenAI call failed:", err);
-      const msg = err?.message || "Azure OpenAI call failed";
-      return res.status(500).json({ error: `Azure OpenAI error: ${msg}` });
-    }
+    const reply = completion?.choices?.[0]?.message?.content?.trim() || "Sorry—no reply returned.";
+    return res.status(200).json({ reply });
   } catch (err) {
     console.error("API crash:", err);
     return res.status(500).json({
       error: err?.message || "Server error",
-      hint:
-        "Check Vercel logs. Most common causes: missing Azure env vars, wrong deployment name, or KB files not reachable via GitHub RAW.",
     });
   }
 };
