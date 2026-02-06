@@ -385,7 +385,7 @@ export default async function handler(req, res) {
     // Call OpenAI — wrap in try/catch and return the error message to frontend for debugging
     try {
       const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: process.env.AZURE_OPENAI_DEPLOYMENT,
         messages: messagesForModel,
         temperature: 0.2
       });
