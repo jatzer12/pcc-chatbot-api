@@ -55,10 +55,20 @@ function rateLimit(ip) {
 
 /** ---------- OpenAI Client (lazy init so missing env is reported cleanly) ---------- */
 function getOpenAIClient() {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return null;
-  return new OpenAI({ apiKey: key });
+  const apiKey = process.env.AZURE_OPENAI_API_KEY;
+  const endpoint = process.env.AZURE_OPENAI_ENDPOINT; // like: https://YOUR-RESOURCE.openai.azure.com
+
+  if (!apiKey || !endpoint) return null;
+
+  // Azure OpenAI v1-compatible base URL
+  const baseURL = `${String(endpoint).replace(/\/+$/, "")}/openai/v1/`;
+
+  return new OpenAI({
+    apiKey,
+    baseURL
+  });
 }
+
 
 /** ---------- CORS helper ---------- */
 function setCors(req, res) {
